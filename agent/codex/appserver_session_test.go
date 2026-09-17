@@ -75,7 +75,9 @@ func TestAppServerSession_HandleRateLimitsUpdatedCachesUsage(t *testing.T) {
 }
 
 func TestAppServerSession_HandleThreadTokenUsageUpdatedCachesContextUsage(t *testing.T) {
-	s := &appServerSession{}
+	// 用量通知必须属于当前会话和轮次。
+	s := &appServerSession{currentTurn: "turn-1"}
+	s.threadID.Store("thread-1")
 	raw, err := json.Marshal(appServerThreadTokenUsageNotification{
 		ThreadID: "thread-1",
 		TurnID:   "turn-1",
@@ -225,6 +227,9 @@ func TestAppServerSession_HandleRequestUserInputEmitsAskQuestion(t *testing.T) {
 		stdin:            stdin,
 	}
 
+	// 审批必须关联当前轮次，过期请求另有回归用例覆盖。
+	s.threadID.Store("thread-1")
+	s.currentTurn = "turn-1"
 	s.handleServerRequest(serverRequestProbe(t, `"rui-1"`, "item/tool/requestUserInput", map[string]any{
 		"threadId": "thread-1",
 		"turnId":   "turn-1",
@@ -286,6 +291,9 @@ func TestAppServerSession_HandleRequestUserInputWritesCodexResponse(t *testing.T
 		stdin:            stdin,
 	}
 
+	// 审批必须关联当前轮次，过期请求另有回归用例覆盖。
+	s.threadID.Store("thread-1")
+	s.currentTurn = "turn-1"
 	s.handleServerRequest(serverRequestProbe(t, `"rui-2"`, "item/tool/requestUserInput", map[string]any{
 		"threadId": "thread-1",
 		"turnId":   "turn-1",

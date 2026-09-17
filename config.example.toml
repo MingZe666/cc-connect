@@ -1604,6 +1604,13 @@ app_secret = "your-feishu-app-secret"
 #
 # [projects.agent]
 # type = "codex"
+# 在对应 [projects.agent.options] 中设置以下选项，可启用忙碌时实时补充：
+# backend = "app_server"
+# app_server_url = "stdio://"
+# busy_message_mode = "steer" # 默认 queue；不支持实时补充的 Agent 继续排队。
+# 原有 cmd、mode、model、网络参数及多工作区配置继续保留。
+# 确认超时会显示待核实，不自动重发；/history 可查看待核实记录。
+
 #
 # [projects.agent.options]
 # work_dir = "/path/to/project"

@@ -18,11 +18,11 @@ const ContinueSession = "__continue__"
 
 // Session tracks one conversation between a user and the agent.
 type Session struct {
-	ID                  string         `json:"id"`
-	Name                string         `json:"name"`
-	AgentSessionID      string         `json:"agent_session_id"`
-	AgentType           string         `json:"agent_type,omitempty"`
-	PastAgentSessionIDs []string       `json:"past_agent_session_ids,omitempty"`
+	ID                  string   `json:"id"`
+	Name                string   `json:"name"`
+	AgentSessionID      string   `json:"agent_session_id"`
+	AgentType           string   `json:"agent_type,omitempty"`
+	PastAgentSessionIDs []string `json:"past_agent_session_ids,omitempty"`
 	// ActiveProvider is the agent provider name that was active when this
 	// session last took a turn. It is restored before --resume so that a
 	// cc-connect process restart does not silently drop a user's
@@ -31,8 +31,10 @@ type Session struct {
 	// — use whatever the agent's default is".
 	ActiveProvider string         `json:"active_provider,omitempty"`
 	History        []HistoryEntry `json:"history"`
-	CreatedAt      time.Time      `json:"created_at"`
-	UpdatedAt      time.Time      `json:"updated_at"`
+	// SteerReceipts 保存补充投递结果，重启后禁止自动重发未知请求。
+	SteerReceipts map[string]SteerReceipt `json:"steer_receipts,omitempty"`
+	CreatedAt     time.Time               `json:"created_at"`
+	UpdatedAt     time.Time               `json:"updated_at"`
 	// LastUserActivity records when a real user message was last received.
 	// Unlike UpdatedAt (bumped by every session.Unlock including heartbeats and
 	// unsolicited agent output), this field is only updated when the engine
@@ -40,8 +42,10 @@ type Session struct {
 	// so that automated activity cannot prevent idle session rotation.
 	LastUserActivity time.Time `json:"last_user_activity,omitempty"`
 
-	mu   sync.Mutex `json:"-"`
-	busy bool       `json:"-"`
+	// admissionMu 串行化普通消息的最终分流，审批和停止不获取此锁。
+	admissionMu sync.Mutex `json:"-"`
+	mu          sync.Mutex `json:"-"`
+	busy        bool       `json:"-"`
 }
 
 func (s *Session) TryLock() bool {
@@ -280,7 +284,9 @@ type sessionSnapshot struct {
 // SessionManager supports multiple named sessions per user with active-session tracking.
 // It can persist state to a JSON file and reload on startup.
 type SessionManager struct {
-	mu            sync.RWMutex
+	mu sync.RWMutex
+	// saveMu 串行化快照和写入，必须在管理锁之后获取。
+	saveMu        sync.Mutex
 	sessions      map[string]*Session
 	activeSession map[string]string
 	userSessions  map[string][]string
@@ -617,14 +623,33 @@ func (sm *SessionManager) deleteByIDLocked(id string) {
 
 // Save persists current state to disk. Safe to call from outside (e.g. after message processing).
 func (sm *SessionManager) Save() {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 	sm.saveLocked()
 }
 
 func (sm *SessionManager) saveLocked() {
+	if err := sm.saveLockedWithError(); err != nil {
+		slog.Error("session: failed to save", "error", err)
+	}
+}
+
+// SaveWithError 允许需要提交前持久化的调用方识别写盘失败。
+func (sm *SessionManager) SaveWithError() error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 	if sm.storePath == "" {
-		return
+		return fmt.Errorf("session: persistence path is empty")
+	}
+	return sm.saveLockedWithError()
+}
+
+// saveLockedWithError 在管理锁内串行创建快照并写盘。
+func (sm *SessionManager) saveLockedWithError() error {
+	sm.saveMu.Lock()
+	defer sm.saveMu.Unlock()
+	if sm.storePath == "" {
+		return nil
 	}
 
 	// Build a deep-copy snapshot to avoid racing with concurrent Session mutations.
@@ -636,7 +661,13 @@ func (sm *SessionManager) saveLocked() {
 			agentSID = ""
 			s.AgentSessionID = ""
 		}
+		receipts := make(map[string]SteerReceipt, len(s.SteerReceipts))
+		for key, receipt := range s.SteerReceipts {
+			receipts[key] = receipt
+		}
 		snapSessions[id] = &Session{
+			SteerReceipts:       receipts,
+			LastUserActivity:    s.LastUserActivity,
 			ID:                  s.ID,
 			Name:                s.Name,
 			AgentSessionID:      agentSID,
@@ -677,16 +708,15 @@ func (sm *SessionManager) saveLocked() {
 	}
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		slog.Error("session: failed to marshal", "error", err)
-		return
+		return fmt.Errorf("session: marshal: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(sm.storePath), 0o755); err != nil {
-		slog.Error("session: failed to create dir", "error", err)
-		return
+		return fmt.Errorf("session: create dir: %w", err)
 	}
 	if err := AtomicWriteFile(sm.storePath, data, 0o644); err != nil {
-		slog.Error("session: failed to write", "path", sm.storePath, "error", err)
+		return fmt.Errorf("session: write: %w", err)
 	}
+	return nil
 }
 
 func (sm *SessionManager) load() {
@@ -703,6 +733,15 @@ func (sm *SessionManager) load() {
 		return
 	}
 	sm.sessions = snap.Sessions
+	// 崩溃前未确认的提交及内存队列不能自动重放。
+	for _, session := range sm.sessions {
+		for key, receipt := range session.SteerReceipts {
+			if receipt.Status == SteerPending || receipt.Status == SteerQueued {
+				receipt.Status = SteerUnknown
+				session.SteerReceipts[key] = receipt
+			}
+		}
+	}
 	sm.activeSession = snap.ActiveSession
 	sm.userSessions = snap.UserSessions
 	sm.sessionNames = snap.SessionNames
@@ -828,7 +867,7 @@ func (sm *SessionManager) PruneDuplicateSessions(mergeHistory bool) PruneResult 
 	defer sm.mu.Unlock()
 
 	// Group sessions by baseChat
-	chatSessions := make(map[string][]*Session) // baseChat -> sessions
+	chatSessions := make(map[string][]*Session)  // baseChat -> sessions
 	sessionToBaseChat := make(map[string]string) // session.ID -> baseChat
 
 	for userKey, sessionIDs := range sm.userSessions {

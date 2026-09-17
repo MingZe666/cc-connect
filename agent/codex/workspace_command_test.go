@@ -14,8 +14,14 @@ func TestWorkspaceAgentOptions_PreservesCommandAndNetworkArgs(t *testing.T) {
 		"codex",
 	} {
 		bin, args := core.ParseCmdOpts(map[string]any{"cmd": command}, "codex")
-		parent := &Agent{cmd: bin, cliExtraArgs: args, mode: "full-auto"}
+		parent := &Agent{cmd: bin, cliExtraArgs: args, mode: "full-auto", backend: "app_server", appServerURL: "stdio://", model: "model-test", reasoningEffort: "high"}
 		opts := parent.WorkspaceAgentOptions()
+		// 后端、模型与网络参数必须作为同一份工作区选项保留。
+		for key, want := range map[string]string{"backend": "app_server", "app_server_url": "stdio://", "model": "model-test", "reasoning_effort": "high"} {
+			if opts[key] != want {
+				t.Fatalf("%s=%v", key, opts[key])
+			}
+		}
 		childBin, childArgs := core.ParseCmdOpts(opts, "codex")
 		if childBin != bin || !reflect.DeepEqual(childArgs, args) {
 			t.Fatalf("workspace command = %q %v, want %q %v", childBin, childArgs, bin, args)

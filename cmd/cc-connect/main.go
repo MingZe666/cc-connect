@@ -419,6 +419,9 @@ func main() {
 		}
 
 		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang)
+		// 配置加载已校验枚举；策略在 Engine 层对所有工作区统一生效。
+		busyMode, _ := core.ParseBusyMessageMode(proj.Agent.Options["busy_message_mode"])
+		engine.SetBusyMessageMode(busyMode)
 		// Wire display settings including show_context_indicator and reply_footer
 		// Global [display] config can be overridden by project-level settings
 		_, _, _, _, _, showCtx, showFooter, _ := config.EffectiveDisplay(cfg, &proj)

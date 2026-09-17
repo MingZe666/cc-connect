@@ -499,7 +499,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 
 	if backend == "app_server" {
-		return newAppServerSession(ctx, appServerURL, workDir, model, reasoningEffort, mode, sessionID, baseURL, provName, extraEnv, codexHome, systemPrompt, appendPrompt)
+		return newAppServerSession(ctx, cliBin, cliExtraArgs, appServerURL, workDir, model, reasoningEffort, mode, sessionID, baseURL, provName, extraEnv, codexHome, systemPrompt, appendPrompt)
 	}
 	if codexHome != "" {
 		extraEnv = append(extraEnv, "CODEX_HOME="+codexHome)
@@ -572,6 +572,13 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 	}
 	if a.codexHome != "" {
 		opts["codex_home"] = a.codexHome
+	}
+	// 工作区实例必须继承项目提示词，确保附件交付等规则进入实际会话。
+	if a.systemPrompt != "" {
+		opts["system_prompt"] = a.systemPrompt
+	}
+	if a.appendPrompt != "" {
+		opts["append_system_prompt"] = a.appendPrompt
 	}
 	return opts
 }
@@ -813,3 +820,6 @@ func (a *Agent) PermissionModes() []core.PermissionModeInfo {
 			DescZh: "跳过所有审批和沙箱（危险）"},
 	}
 }
+
+// SupportsTurnSteering 仅 App Server 的 Send 提供启动确认，exec 保持原有排队。
+func (a *Agent) SupportsTurnSteering() bool { return a.backend == "app_server" }

@@ -2446,3 +2446,152 @@ func TestCUJ_H5_AutoWorkspaceProcessesFirstMessage(t *testing.T) {
 		}
 	}
 }
+
+// TestCUJ_STEER1_CurrentTurnSupplements 从用户入口覆盖连续补充、最终回复与历史。
+func TestCUJ_STEER1_CurrentTurnSupplements(t *testing.T) {
+	env, as := newSteerJourney(t)
+	sendSteerJourney(env, "start", "write report")
+	select {
+	case <-as.started:
+	case <-time.After(time.Second):
+		t.Fatal("turn not started")
+	}
+	sendSteerJourney(env, "year", "only 2026")
+	waitSteerReply(env, "Added to the current task")
+	env.plat.clearSent()
+	sendSteerJourney(env, "format", "use a table")
+	waitSteerReply(env, "Added to the current task")
+	as.finish()
+	waitSteerReply(env, "report:")
+	env.plat.clearSent()
+	sendSteerJourney(env, "history", "/history")
+	waitSteerReply(env, "only 2026")
+	waitSteerReply(env, "use a table")
+	select {
+	case id := <-as.started:
+		t.Fatalf("unexpected extra turn %s", id)
+	default:
+	}
+}
+
+// TestCUJ_STEER2_UnknownDoesNotReplay 覆盖轮次结束后重投和用户查询待核实历史。
+func TestCUJ_STEER2_UnknownDoesNotReplay(t *testing.T) {
+	env, as := newSteerJourney(t)
+	as.steerErr = &SteerError{Kind: SteerUnknownResult, Cause: fmt.Errorf("timeout")}
+	sendSteerJourney(env, "start", "write report")
+	select {
+	case <-as.started:
+	case <-time.After(time.Second):
+		t.Fatal("turn not started")
+	}
+	sendSteerJourney(env, "year", "only 2026")
+	waitSteerReply(env, "not resent")
+	as.finish()
+	waitSteerReply(env, "report:")
+	sendSteerJourney(env, "year", "only 2026")
+	sendSteerJourney(env, "history", "/history")
+	waitSteerReply(env, "Unconfirmed addition [year]")
+	// 切换本地会话后仍从同一聊天的旧记录去重。
+	sendSteerJourney(env, "new", "/new")
+	sendSteerJourney(env, "year", "only 2026")
+	waitSteerReply(env, "not resent")
+	select {
+	case id := <-as.started:
+		t.Fatalf("unknown message resent: %s", id)
+	default:
+	}
+}
+
+// TestCUJ_H4_SteerWorkspaceIsolation 补充已有 H4：同 ID 在两个工作区不串消息。
+func TestCUJ_H4_SteerWorkspaceIsolation(t *testing.T) {
+	const agentName = "cuj-steer-workspaces"
+	base := t.TempDir()
+	dirA := filepath.Join(base, "a")
+	dirB := filepath.Join(base, "b")
+	for _, dir := range []string{dirA, dirB} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	} // 测试工作区普通目录权限。
+	a := &steerJourneySession{events: make(chan Event, 8), started: make(chan string, 8)} // 缓冲容纳用例事件。
+	b := &steerJourneySession{events: make(chan Event, 8), started: make(chan string, 8)}
+	RegisterAgent(agentName, func(opts map[string]any) (Agent, error) {
+		workDir, _ := opts["work_dir"].(string)
+		session := a
+		if filepath.Base(workDir) == "b" {
+			session = b
+		}
+		return &steerWorkspaceAgent{resultAgent: resultAgent{session: session}, name: agentName}, nil
+	})
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &steerWorkspaceAgent{resultAgent: resultAgent{session: a}, name: agentName}, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	defer e.cancel()
+	e.SetBusyMessageMode(BusyMessageSteer)
+	e.SetMultiWorkspace(base, filepath.Join(t.TempDir(), "bindings.json"))
+	for channel, dir := range map[string]string{"a": dirA, "b": dirB} {
+		e.workspaceBindings.Bind("project:test", workspaceChannelKey("test", channel), channel, dir)
+	}
+	env := &cujEnv{t: t, engine: e, plat: p}
+	send := func(channel, id, content string) {
+		e.ReceiveMessage(p, &Message{Platform: "test", SessionKey: "test:" + channel, ChannelKey: channel, MessageID: id, Content: content, UserID: "user"})
+	}
+	send("a", "start", "report A")
+	send("b", "start", "report B")
+	for _, s := range []*steerJourneySession{a, b} {
+		select {
+		case <-s.started:
+		case <-time.After(time.Second):
+			t.Fatal("workspace not started")
+		}
+	}
+	send("a", "same", "only 2026")
+	waitSteerReply(env, "Added to the current task")
+	p.clearSent()
+	send("b", "same", "only 2025")
+	waitSteerReply(env, "Added to the current task")
+	a.finish()
+	b.finish()
+	waitSteerReply(env, "only 2026")
+	waitSteerReply(env, "only 2025")
+	for _, reply := range p.getSent() {
+		if strings.Contains(reply, "2026") && strings.Contains(reply, "2025") {
+			t.Fatalf("workspace bleed: %s", reply)
+		}
+	}
+}
+
+// TestCUJ_STEER3_ConsecutiveStartupAdditions 连续两轮和 /new 后均可在启动期间补充。
+func TestCUJ_STEER3_ConsecutiveStartupAdditions(t *testing.T) {
+	const rounds = 3 // 首轮、复用轮次、/new 后轮次。
+	as := &delayedSteerJourney{steerJourneySession: steerJourneySession{events: make(chan Event, rounds), started: make(chan string, rounds)}, ready: make(chan struct{})}
+	p := &stubPlatformEngine{n: "test"}
+	a := &startupSteerAgent{resultAgent{session: as}}
+	e := NewEngine("test", a, []Platform{p}, filepath.Join(t.TempDir(), "sessions.json"), LangEnglish)
+	defer e.cancel()
+	e.SetBusyMessageMode(BusyMessageSteer)
+	env := &cujEnv{t: t, engine: e, plat: p}
+	for i := 0; i < rounds; i++ {
+		if i == rounds-1 {
+			sendSteerJourney(env, "new", "/new")
+		}
+		id := fmt.Sprintf("round-%d", i)
+		sendSteerJourney(env, id, "report")
+		select {
+		case <-as.started:
+		case <-time.After(time.Second):
+			t.Fatal("no start")
+		}
+		sendSteerJourney(env, id+"-file", "file context")
+		sendSteerJourney(env, id+"-year", "only 2026")
+		if strings.Contains(strings.Join(p.getSent(), "\n"), "queued") {
+			t.Fatal("startup addition queued")
+		}
+		as.ready <- struct{}{}
+		env.waitFor("accepted additions", 3*time.Second, func() bool {
+			count := strings.Count(strings.Join(p.getSent(), "\n"), "Added to the current task")
+			return count == (i+1)*2 // 每轮两条补充均有用户可见确认。
+		})
+		as.finish()
+		env.waitFor("turn report", 3*time.Second, func() bool { return strings.Count(strings.Join(p.getSent(), "\n"), "report:") == i+1 })
+	}
+}

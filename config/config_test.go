@@ -3490,3 +3490,19 @@ func TestWorkspaceAutoCreateOptIn(t *testing.T) {
 		}
 	}
 }
+
+// TestSteerConfigCompatibility 校验默认、大小写和非法类型，避免开关静默失效。
+func TestSteerConfigCompatibility(t *testing.T) {
+	for _, tc := range []struct {
+		value any
+		valid bool
+	}{{nil, true}, {"", true}, {"queue", true}, {" STEER ", true}, {"typo", false}, {true, false}} {
+		project := validProject("steer")
+		project.Agent.Options = map[string]any{"busy_message_mode": tc.value}
+		cfg := Config{Projects: []ProjectConfig{project}}
+		err := cfg.validate()
+		if (err == nil) != tc.valid {
+			t.Fatalf("%v: %v", tc.value, err)
+		}
+	}
+}

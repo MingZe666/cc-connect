@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/BurntSushi/toml"
+	"github.com/chenhg5/cc-connect/core"
 )
 
 // validRunAsUserName is the portable-username character set plus digits.
@@ -1027,6 +1028,10 @@ func (c *Config) validateInternal(permissive bool) error {
 	}
 	for i, proj := range c.Projects {
 		prefix := fmt.Sprintf("projects[%d]", i)
+		// 在启动前拒绝无效忙碌策略，避免配置拼写错误静默生效。
+		if _, err := core.ParseBusyMessageMode(proj.Agent.Options["busy_message_mode"]); err != nil {
+			return fmt.Errorf("config: %s.agent.options: %w", prefix, err)
+		}
 		if proj.Name == "" {
 			return fmt.Errorf("config: %s.name is required", prefix)
 		}

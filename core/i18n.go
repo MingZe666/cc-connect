@@ -173,6 +173,12 @@ const (
 	MsgNoExecution               MsgKey = "no_execution"
 	MsgPreviousProcessing        MsgKey = "previous_processing"
 	MsgQueueFull                 MsgKey = "queue_full"
+	MsgSteerAccepted             MsgKey = "steer_accepted"        // 实时补充投递状态。
+	MsgSteerUnknown              MsgKey = "steer_unknown"         // 实时补充投递状态。
+	MsgSteerPending              MsgKey = "steer_pending"         // 实时补充投递状态。
+	MsgSteerRejected             MsgKey = "steer_rejected"        // 实时补充投递状态。
+	MsgSteerSaveFailed           MsgKey = "steer_save_failed"     // 实时补充投递状态。
+	MsgSteerHistoryUnknown       MsgKey = "steer_history_unknown" // 实时补充投递状态。
 	MsgMessageQueued             MsgKey = "message_queued"
 	MsgNoToolsAllowed            MsgKey = "no_tools_allowed"
 	MsgCurrentTools              MsgKey = "current_tools"
@@ -378,31 +384,31 @@ const (
 	MsgCronIDLabel               MsgKey = "cron_id_label"
 	MsgCronFailedSuffix          MsgKey = "cron_failed_suffix"
 
-	MsgTimerNotAvailable  MsgKey = "timer_not_available"
-	MsgTimerUsage         MsgKey = "timer_usage"
-	MsgTimerAddUsage      MsgKey = "timer_add_usage"
-	MsgTimerAdded         MsgKey = "timer_added"
-	MsgTimerAddedExec     MsgKey = "timer_added_exec"
-	MsgTimerAddExecUsage  MsgKey = "timer_addexec_usage"
-	MsgTimerEmpty         MsgKey = "timer_empty"
-	MsgTimerListTitle     MsgKey = "timer_list_title"
-	MsgTimerListFooter    MsgKey = "timer_list_footer"
-	MsgTimerDelUsage      MsgKey = "timer_del_usage"
-	MsgTimerMuteUsage     MsgKey = "timer_mute_usage"
-	MsgTimerDeleted       MsgKey = "timer_deleted"
-	MsgTimerNotFound      MsgKey = "timer_not_found"
-	MsgTimerMuted         MsgKey = "timer_muted"
-	MsgTimerUnmuted       MsgKey = "timer_unmuted"
-	MsgTimerCardHint      MsgKey = "timer_card_hint"
-	MsgTimerBtnMute       MsgKey = "timer_btn_mute"
-	MsgTimerBtnUnmute     MsgKey = "timer_btn_unmute"
-	MsgTimerBtnDelete     MsgKey = "timer_btn_delete"
-	MsgTimerIDLabel       MsgKey = "timer_id_label"
-	MsgTimerScheduledLabel MsgKey = "timer_scheduled_label"
-	MsgTimerFailedSuffix  MsgKey = "timer_failed_suffix"
-	MsgCommandsTagAgent          MsgKey = "commands_tag_agent"
-	MsgCommandsTagShell          MsgKey = "commands_tag_shell"
-	MsgUpgradeTimeoutSuffix      MsgKey = "upgrade_timeout_suffix"
+	MsgTimerNotAvailable    MsgKey = "timer_not_available"
+	MsgTimerUsage           MsgKey = "timer_usage"
+	MsgTimerAddUsage        MsgKey = "timer_add_usage"
+	MsgTimerAdded           MsgKey = "timer_added"
+	MsgTimerAddedExec       MsgKey = "timer_added_exec"
+	MsgTimerAddExecUsage    MsgKey = "timer_addexec_usage"
+	MsgTimerEmpty           MsgKey = "timer_empty"
+	MsgTimerListTitle       MsgKey = "timer_list_title"
+	MsgTimerListFooter      MsgKey = "timer_list_footer"
+	MsgTimerDelUsage        MsgKey = "timer_del_usage"
+	MsgTimerMuteUsage       MsgKey = "timer_mute_usage"
+	MsgTimerDeleted         MsgKey = "timer_deleted"
+	MsgTimerNotFound        MsgKey = "timer_not_found"
+	MsgTimerMuted           MsgKey = "timer_muted"
+	MsgTimerUnmuted         MsgKey = "timer_unmuted"
+	MsgTimerCardHint        MsgKey = "timer_card_hint"
+	MsgTimerBtnMute         MsgKey = "timer_btn_mute"
+	MsgTimerBtnUnmute       MsgKey = "timer_btn_unmute"
+	MsgTimerBtnDelete       MsgKey = "timer_btn_delete"
+	MsgTimerIDLabel         MsgKey = "timer_id_label"
+	MsgTimerScheduledLabel  MsgKey = "timer_scheduled_label"
+	MsgTimerFailedSuffix    MsgKey = "timer_failed_suffix"
+	MsgCommandsTagAgent     MsgKey = "commands_tag_agent"
+	MsgCommandsTagShell     MsgKey = "commands_tag_shell"
+	MsgUpgradeTimeoutSuffix MsgKey = "upgrade_timeout_suffix"
 
 	MsgCronScheduleLabel MsgKey = "cron_schedule_label"
 	MsgCronNextRunLabel  MsgKey = "cron_next_run_label"
@@ -736,6 +742,48 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "⏳ 上一個請求仍在處理中。使用 `/ps <訊息>` 可向正在執行的任務追加補充資訊。",
 		LangJapanese:           "⏳ 前のリクエストを処理中です。`/ps <メッセージ>` で実行中のタスクに補足情報を送れます。",
 		LangSpanish:            "⏳ La solicitud anterior aún se está procesando. Use `/ps <mensaje>` para enviar un P.S. a la tarea en curso.",
+	},
+	MsgSteerAccepted: {
+		LangEnglish:            "Added to the current task.",
+		LangChinese:            "已补充到当前任务。",
+		LangTraditionalChinese: "已補充到目前任務。",
+		LangJapanese:           "現在のタスクに追加しました。",
+		LangSpanish:            "Añadido a la tarea actual.",
+	},
+	MsgSteerUnknown: {
+		LangEnglish:            "Receipt is unconfirmed; not resent. Check the current task result.",
+		LangChinese:            "补充是否收到暂时无法确认，未自动重发；请核对当前任务结果。",
+		LangTraditionalChinese: "暫時無法確認補充是否收到，未自動重送；請核對目前任務結果。",
+		LangJapanese:           "受信を確認できません。再送していません。タスク結果を確認してください。",
+		LangSpanish:            "Recepción sin confirmar; no se reenvió. Revise el resultado.",
+	},
+	MsgSteerPending: {
+		LangEnglish:            "Waiting for confirmation of this addition.",
+		LangChinese:            "正在等待本条补充的接收确认。",
+		LangTraditionalChinese: "正在等待本則補充的接收確認。",
+		LangJapanese:           "追加内容の受信確認を待っています。",
+		LangSpanish:            "Esperando confirmación de esta adición.",
+	},
+	MsgSteerRejected: {
+		LangEnglish:            "Could not add to the task: %s",
+		LangChinese:            "补充失败：%s",
+		LangTraditionalChinese: "補充失敗：%s",
+		LangJapanese:           "タスクに追加できませんでした：%s",
+		LangSpanish:            "No se pudo añadir a la tarea: %s",
+	},
+	MsgSteerSaveFailed: {
+		LangEnglish:            "Could not save the local delivery record; do not automatically resend.",
+		LangChinese:            "本地投递记录保存失败，请勿自动重发。",
+		LangTraditionalChinese: "本機投遞記錄儲存失敗，請勿自動重送。",
+		LangJapanese:           "配信記録を保存できませんでした。自動再送しないでください。",
+		LangSpanish:            "No se pudo guardar el registro local; no reenvíe automáticamente.",
+	},
+	MsgSteerHistoryUnknown: {
+		LangEnglish:            "Unconfirmed addition [%s]: %s",
+		LangChinese:            "待核实补充 [%s]：%s",
+		LangTraditionalChinese: "待核實補充 [%s]：%s",
+		LangJapanese:           "未確認の追加 [%s]：%s",
+		LangSpanish:            "Adición sin confirmar [%s]: %s",
 	},
 	MsgMessageQueued: {
 		LangEnglish:            "📬 Message received — will process after the current task finishes.",

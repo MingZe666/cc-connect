@@ -21,9 +21,10 @@ import (
 )
 
 type rpcResponseEnvelope struct {
-	ID     any             `json:"id"`
-	Result json.RawMessage `json:"result"`
-	Error  *rpcError       `json:"error"`
+	ID             any             `json:"id"`
+	Result         json.RawMessage `json:"result"`
+	Error          *rpcError       `json:"error"`
+	TransportError error           `json:"-"` // 本地断连不能伪装成服务端明确拒绝。
 }
 
 type rpcNotificationEnvelope struct {
@@ -32,8 +33,9 @@ type rpcNotificationEnvelope struct {
 }
 
 type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data,omitempty"`
 }
 
 type initResponse struct {
@@ -81,8 +83,14 @@ type itemNotification struct {
 	Item     map[string]any `json:"item"`
 }
 
+// errorNotification 保留错误归属和重试状态，避免其他轮次终止当前任务。
 type errorNotification struct {
-	Message string `json:"message"`
+	ThreadID  string `json:"threadId"`
+	TurnID    string `json:"turnId"`
+	WillRetry bool   `json:"willRetry"`
+	Error     struct {
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 type appServerRateLimitsResponse struct {
@@ -141,6 +149,8 @@ type appServerRequestUserInputAnswer struct {
 }
 
 type appServerSession struct {
+	cliBin         string   // 复用配置解析后的可执行文件。
+	cliExtraArgs   []string // 复制调用方参数，避免多工作区共享可变切片。
 	url            string
 	workDir        string
 	model          string
@@ -176,10 +186,18 @@ type appServerSession struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 
-	stateMu      sync.Mutex
-	pendingMsgs  []string
-	currentTurn  string
-	preambleSent bool
+	stateMu          sync.Mutex
+	pendingMsgs      []string
+	currentTurn      string
+	starting         bool                                // 本地 turn/start 正在等待确认或开始通知。
+	generation       uint64                              // 区分同一会话的连续启动请求。
+	earlyCompletions map[string]turnNotification         // Starting 阶段的终态，等响应确认归属。
+	completedTurns   map[string]bool                     // 拒绝已经终止轮次的迟到通知。
+	steerTimeout     time.Duration                       // 零值使用默认补充超时。
+	responseHooks    map[int64]func(rpcResponseEnvelope) // 在读循环交付响应前应用状态。
+	emitMu           sync.RWMutex                        // 关闭事件通道前等待所有发送者退出。
+	eventsClosed     bool
+	preambleSent     bool
 
 	runtimeMu sync.RWMutex
 	usage     *core.UsageReport
@@ -191,9 +209,11 @@ const (
 	appServerUsageRefreshTimeout = 1500 * time.Millisecond
 )
 
-func newAppServerSession(ctx context.Context, url, workDir, model, effort, mode, resumeID, baseURL, modelProvider string, extraEnv []string, codexHome string, systemPrompt string, appendPrompt string) (*appServerSession, error) {
+func newAppServerSession(ctx context.Context, cliBin string, cliExtraArgs []string, url, workDir, model, effort, mode, resumeID, baseURL, modelProvider string, extraEnv []string, codexHome string, systemPrompt string, appendPrompt string) (*appServerSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 	s := &appServerSession{
+		cliBin:           cliBin,
+		cliExtraArgs:     append([]string(nil), cliExtraArgs...),
 		url:              url,
 		workDir:          workDir,
 		model:            model,
@@ -235,23 +255,11 @@ func newAppServerSession(ctx context.Context, url, workDir, model, effort, mode,
 }
 
 func (s *appServerSession) connect() error {
-	args := []string{"app-server"}
-	if strings.TrimSpace(s.url) != "" {
-		args = append(args, "--listen", strings.TrimSpace(s.url))
+	args, err := s.buildAppServerArgs()
+	if err != nil {
+		return err
 	}
-	if model := strings.TrimSpace(s.model); model != "" {
-		args = append(args, "-c", fmt.Sprintf("model=%q", model))
-	}
-	if effort := strings.TrimSpace(s.effort); effort != "" {
-		args = append(args, "-c", fmt.Sprintf("model_reasoning_effort=%q", effort))
-	}
-	if provider := strings.TrimSpace(s.modelProvider); provider != "" {
-		args = append(args, "-c", fmt.Sprintf("model_provider=%q", provider))
-	}
-	if baseURL := strings.TrimSpace(s.baseURL); baseURL != "" {
-		args = append(args, "-c", fmt.Sprintf("openai_base_url=%q", baseURL))
-	}
-	cmd := exec.CommandContext(s.ctx, "codex", args...)
+	cmd := exec.CommandContext(s.ctx, s.cliBin, args...)
 	cmd.Dir = s.workDir
 	env := append([]string(nil), s.extraEnv...)
 	if s.codexHome != "" {
@@ -446,39 +454,34 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 		return fmt.Errorf("session is closed")
 	}
 
-	if len(files) > 0 {
-		filePaths := core.SaveFilesToDisk(s.workDir, messageID, files)
-		prompt = core.AppendFileRefs(prompt, filePaths)
+	s.stateMu.Lock()
+	if s.starting || s.currentTurn != "" {
+		s.stateMu.Unlock()
+		return fmt.Errorf("codex app-server: turn already active")
 	}
-
-	prompt, imagePaths, err := s.stageImages(prompt, images)
+	s.starting = true
+	s.earlyCompletions = make(map[string]turnNotification)
+	s.generation++
+	generation := s.generation
+	if !s.preambleSent {
+		prompt = prependCodexPromptPreamble(prompt, s.promptPreamble)
+	}
+	s.stateMu.Unlock()
+	// 无论 RPC 如何结束，都只释放本次启动的保留状态。
+	defer func() {
+		s.stateMu.Lock()
+		if s.generation == generation {
+			s.starting = false
+		}
+		s.stateMu.Unlock()
+	}()
+	input, err := s.prepareTurnInput(prompt, messageID, images, files)
 	if err != nil {
 		return err
 	}
-
-	s.stateMu.Lock()
-	if !s.preambleSent {
-		prompt = prependCodexPromptPreamble(prompt, s.promptPreamble)
-		s.preambleSent = true
-	}
-	s.stateMu.Unlock()
-
 	threadID := s.CurrentSessionID()
 	if threadID == "" {
 		return fmt.Errorf("codex app-server thread id is empty")
-	}
-
-	input := make([]map[string]any, 0, 1+len(imagePaths))
-	input = append(input, map[string]any{
-		"type":          "text",
-		"text":          prompt,
-		"text_elements": []any{},
-	})
-	for _, path := range imagePaths {
-		input = append(input, map[string]any{
-			"type": "localImage",
-			"path": path,
-		})
 	}
 
 	params := map[string]any{
@@ -496,7 +499,15 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 	}
 
 	var resp turnStartResponse
-	if err := s.request("turn/start", params, &resp); err != nil {
+	if err := s.requestWithHook("turn/start", params, &resp, appServerRequestTimeout, func(response rpcResponseEnvelope) {
+		if response.Error != nil || response.TransportError != nil {
+			return
+		}
+		var start turnStartResponse
+		if json.Unmarshal(response.Result, &start) == nil {
+			s.acceptStartedTurn(threadID, start.Turn.ID, generation)
+		}
+	}); err != nil {
 		return fmt.Errorf("codex app-server turn/start: %w", err)
 	}
 	if resp.Turn.ID == "" {
@@ -504,8 +515,7 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 	}
 
 	s.stateMu.Lock()
-	s.currentTurn = resp.Turn.ID
-	s.pendingMsgs = s.pendingMsgs[:0]
+	s.preambleSent = true
 	s.stateMu.Unlock()
 
 	return nil
@@ -522,12 +532,20 @@ func (s *appServerSession) stageImages(prompt string, images []core.ImageAttachm
 	}
 
 	imagePaths := make([]string, 0, len(images))
-	for i, img := range images {
+	for _, img := range images {
 		ext := codexImageExt(img.MimeType)
-		fname := fmt.Sprintf("img_%d_%d%s", time.Now().UnixMilli(), i, ext)
-		fpath := filepath.Join(imgDir, fname)
-		if err := os.WriteFile(fpath, img.Data, 0o644); err != nil {
-			return "", nil, fmt.Errorf("codex app-server: save image: %w", err)
+		f, err := os.CreateTemp(imgDir, "img_*"+ext)
+		if err != nil {
+			return "", nil, fmt.Errorf("codex app-server: create image: %w", err)
+		}
+		fpath := f.Name()
+		_, writeErr := f.Write(img.Data)
+		closeErr := f.Close()
+		if writeErr != nil {
+			return "", nil, fmt.Errorf("codex app-server: save image: %w", writeErr)
+		}
+		if closeErr != nil {
+			return "", nil, fmt.Errorf("codex app-server: close image: %w", closeErr)
 		}
 		imagePaths = append(imagePaths, fpath)
 	}
@@ -560,7 +578,16 @@ func (s *appServerSession) handleServerRequest(probe map[string]json.RawMessage)
 		return
 	}
 	params := probe["params"]
-
+	var target struct {
+		ThreadID string `json:"threadId"`
+		TurnID   string `json:"turnId"`
+	}
+	if json.Unmarshal(params, &target) == nil && (target.ThreadID != "" || target.TurnID != "") && !s.matchesTurn(target.ThreadID, target.TurnID) {
+		if err := s.writeJSON(map[string]any{"id": rawID, "error": map[string]any{"code": rpcInvalidRequest, "message": "request does not belong to active turn"}}); err != nil {
+			slog.Warn("codex app-server: reject stale request", "error", err)
+		}
+		return
+	}
 	switch method {
 	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval":
 		s.handleApprovalRequest(rawID, method, params)
@@ -963,6 +990,9 @@ func (s *appServerSession) Close() error {
 	}
 
 	s.closeOnce.Do(func() {
+		s.emitMu.Lock()
+		defer s.emitMu.Unlock()
+		s.eventsClosed = true
 		close(s.events)
 	})
 	return nil
@@ -1086,6 +1116,8 @@ func (s *appServerSession) handleResponse(resp rpcResponseEnvelope) {
 
 	s.pendingMu.Lock()
 	ch := s.pending[id]
+	hook := s.responseHooks[id]
+	delete(s.responseHooks, id)
 	delete(s.pending, id)
 	s.pendingMu.Unlock()
 
@@ -1093,6 +1125,9 @@ func (s *appServerSession) handleResponse(resp rpcResponseEnvelope) {
 		return
 	}
 
+	if hook != nil {
+		hook(resp)
+	}
 	select {
 	case ch <- resp:
 	default:
@@ -1103,43 +1138,25 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 	switch method {
 	case "turn/started":
 		var notif turnNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
-			s.stateMu.Lock()
-			s.currentTurn = notif.Turn.ID
-			s.pendingMsgs = s.pendingMsgs[:0]
-			s.stateMu.Unlock()
-			s.storeContextUsage(nil)
+		if json.Unmarshal(paramsRaw, &notif) == nil {
+			s.acceptStartedTurn(notif.ThreadID, notif.Turn.ID, 0)
 		}
-
-	case "item/started":
+	case "item/started", "item/completed":
 		var notif itemNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
-			s.handleItemStarted(notif.Item)
+		if json.Unmarshal(paramsRaw, &notif) == nil && s.matchesTurn(notif.ThreadID, notif.TurnID) {
+			if method == "item/started" {
+				s.handleItemStarted(notif.Item)
+			} else {
+				s.handleItemCompleted(notif.Item)
+			}
 		}
-
-	case "item/completed":
-		var notif itemNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
-			s.handleItemCompleted(notif.Item)
-		}
-
 	case "turn/completed":
 		var notif turnNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
-			s.completeTurn()
+		if json.Unmarshal(paramsRaw, &notif) == nil {
+			s.handleTurnCompleted(notif)
 		}
-
 	case "thread/status/changed":
-		var notif struct {
-			ThreadID string `json:"threadId"`
-			Status   struct {
-				Type string `json:"type"`
-			} `json:"status"`
-		}
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil && notif.Status.Type == "idle" {
-			// In codex 0.125+, thread going idle signals turn completion.
-			s.completeTurn()
-		}
+		// idle 不包含轮次身份，不能用它结束可能已经开始的下一轮。
 
 	case "account/rateLimits/updated":
 		var notif appServerRateLimitsResponse
@@ -1149,14 +1166,15 @@ func (s *appServerSession) handleNotification(method string, paramsRaw json.RawM
 
 	case "thread/tokenUsage/updated":
 		var notif appServerThreadTokenUsageNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil {
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && s.matchesTurn(notif.ThreadID, notif.TurnID) {
 			s.storeContextUsage(mapAppServerTokenUsage(notif))
 		}
 
 	case "error":
 		var notif errorNotification
-		if err := json.Unmarshal(paramsRaw, &notif); err == nil && strings.TrimSpace(notif.Message) != "" {
-			s.emitError(fmt.Errorf("%s", notif.Message))
+		if err := json.Unmarshal(paramsRaw, &notif); err == nil && s.matchesTurn(notif.ThreadID, notif.TurnID) && !notif.WillRetry && strings.TrimSpace(notif.Error.Message) != "" {
+			// error 仅为诊断通知；等待 turn/completed 唯一结算，避免提前发送下一轮。
+			slog.Warn("codex app-server turn error reported; awaiting completion", "thread", notif.ThreadID, "turn", notif.TurnID)
 		}
 	}
 }
@@ -1508,15 +1526,30 @@ func rpcIDToInt64(v any) (int64, bool) {
 	return 0, false
 }
 
-func (s *appServerSession) completeTurn() {
+// completeTurn 原子完成当前轮并摘取输出，重复完成不会产生新事件。
+func (s *appServerSession) completeTurn(turnErrors ...error) {
 	s.stateMu.Lock()
 	if s.currentTurn == "" {
 		s.stateMu.Unlock()
 		return
 	}
+	if s.completedTurns == nil {
+		s.completedTurns = make(map[string]bool)
+	}
+	s.completedTurns[s.currentTurn] = true
 	s.currentTurn = ""
+	msgs := append([]string(nil), s.pendingMsgs...)
+	s.pendingMsgs = nil
 	s.stateMu.Unlock()
-	s.flushPendingAsText()
+	for _, text := range msgs {
+		if strings.TrimSpace(text) != "" {
+			s.emit(core.Event{Type: core.EventText, Content: text})
+		}
+	}
+	if len(turnErrors) > 0 {
+		s.emitError(turnErrors[0])
+		return
+	}
 	s.emit(core.Event{Type: core.EventResult, SessionID: s.CurrentSessionID(), Done: true})
 }
 
@@ -1547,6 +1580,19 @@ func (s *appServerSession) flushPendingAsText() {
 }
 
 func (s *appServerSession) emit(event core.Event) {
+	s.emitMu.RLock()
+	defer s.emitMu.RUnlock()
+	if s.eventsClosed {
+		return
+	}
+	// 文本与终态都不可静默丢弃；取消时允许退出，关闭方等待发送者释放锁。
+	if event.Type == core.EventResult || event.Type == core.EventText || event.Type == core.EventError {
+		select {
+		case s.events <- event:
+		case <-s.contextDone():
+		}
+		return
+	}
 	select {
 	case s.events <- event:
 	default:
@@ -1567,7 +1613,7 @@ func (s *appServerSession) rejectPending(err error) {
 	for id, ch := range s.pending {
 		delete(s.pending, id)
 		select {
-		case ch <- rpcResponseEnvelope{ID: id, Error: &rpcError{Message: err.Error()}}:
+		case ch <- rpcResponseEnvelope{ID: id, TransportError: err}:
 		default:
 		}
 	}
@@ -1578,7 +1624,13 @@ func (s *appServerSession) request(method string, params any, out any) error {
 }
 
 func (s *appServerSession) requestWithTimeout(method string, params any, out any, timeout time.Duration) error {
+	return s.requestWithHook(method, params, out, timeout, nil)
+}
+
+// requestWithHook 在读循环确认状态后才返回，避免响应与通知倒序修改轮次。
+func (s *appServerSession) requestWithHook(method string, params any, out any, timeout time.Duration, hook func(rpcResponseEnvelope)) error {
 	id := s.nextID.Add(1)
+	slog.Debug("codex app-server request", "rpc_id", id, "method", method)
 	ch := make(chan rpcResponseEnvelope, 1)
 
 	s.pendingMu.Lock()
@@ -1586,7 +1638,12 @@ func (s *appServerSession) requestWithTimeout(method string, params any, out any
 		s.pending = make(map[int64]chan rpcResponseEnvelope)
 	}
 	s.pending[id] = ch
+	if s.responseHooks == nil {
+		s.responseHooks = make(map[int64]func(rpcResponseEnvelope))
+	}
+	s.responseHooks[id] = hook
 	s.pendingMu.Unlock()
+	defer func() { s.pendingMu.Lock(); delete(s.pending, id); delete(s.responseHooks, id); s.pendingMu.Unlock() }()
 
 	payload := map[string]any{
 		"jsonrpc": "2.0",
@@ -1615,8 +1672,11 @@ func (s *appServerSession) requestWithTimeout(method string, params any, out any
 	ctxDone := s.contextDone()
 	select {
 	case resp := <-ch:
+		if resp.TransportError != nil {
+			return resp.TransportError
+		}
 		if resp.Error != nil {
-			return fmt.Errorf("%s", strings.TrimSpace(resp.Error.Message))
+			return resp.Error
 		}
 		if out != nil {
 			if err := json.Unmarshal(resp.Result, out); err != nil {
@@ -1717,6 +1777,11 @@ func (s *appServerSession) writeJSON(v any) error {
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	select {
+	case <-s.contextDone():
+		return s.contextErr()
+	default:
+	}
 	if _, err := stdin.Write(append(b, '\n')); err != nil {
 		return fmt.Errorf("codex app-server write: %w", err)
 	}
