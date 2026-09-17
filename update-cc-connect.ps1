@@ -24,8 +24,14 @@ function Find-CcGo([string]$ExplicitPath) {
     if ($ExplicitPath) { return (Resolve-Path -LiteralPath $ExplicitPath).Path }
     $command = Get-Command go.exe -ErrorAction SilentlyContinue
     if ($command) { return $command.Source }
-    $installed = "$env:LOCALAPPDATA\Programs\cc-connect-tools\go1.25.0\go\bin\go.exe"
-    if (Test-Path -LiteralPath $installed) { return $installed }
+    $toolsRoot = Join-Path $env:LOCALAPPDATA 'Programs\cc-connect-tools'
+    $versions = @(Get-ChildItem -LiteralPath $toolsRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^go\d+\.\d+\.\d+$' } |
+        Sort-Object { [version]$_.Name.Substring(2) } -Descending)
+    foreach ($version in $versions) {
+        $installed = Join-Path $version.FullName 'go\bin\go.exe'
+        if (Test-Path -LiteralPath $installed -PathType Leaf) { return $installed }
+    }
     throw '未找到 Go，请通过 -GoPath 指定 go.exe。'
 }
 
@@ -33,6 +39,12 @@ function Find-CcGo([string]$ExplicitPath) {
 function Invoke-CcCommand([string]$File, [string[]]$Arguments) {
     & $File @Arguments | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "命令失败：$File，退出码 $LASTEXITCODE" }
+}
+
+function Install-CcWebDependencies([string]$Npm) {
+    if (Test-Path -LiteralPath 'node_modules') { return }
+    $operation = if (Test-Path -LiteralPath 'package-lock.json') { 'ci' } else { 'install' }
+    Invoke-CcCommand $Npm @($operation)
 }
 
 # 仅选择目标绝对路径的进程；不按程序名称批量停止其他实例。
@@ -151,7 +163,7 @@ function Invoke-CcUpdate {
         $candidate = Join-Path $runDirectory 'cc-connect.candidate.exe'
         Push-Location (Join-Path $PSScriptRoot 'web')
         try {
-            if (!(Test-Path -LiteralPath 'node_modules')) { Invoke-CcCommand $npm @('ci') }
+            Install-CcWebDependencies $npm
             Invoke-CcCommand $npm @('run', 'build')
         } finally { Pop-Location }
         Push-Location $PSScriptRoot

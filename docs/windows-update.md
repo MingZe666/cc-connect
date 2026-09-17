@@ -12,6 +12,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\update-cc-connect.ps1
 
 默认目标为仓库 `dist\cc-connect.exe`，配置为当前用户 `.cc-connect\config.toml`。
 
+Go 查找顺序为 `-GoPath`、PATH、`%LOCALAPPDATA%\Programs\cc-connect-tools\go版本号\go\bin\go.exe`（优先最高版本）。需预先安装符合 `go.mod` 要求的 Go；脚本本身不会下载工具链。
+
 请在导账任务结束后执行。脚本使用 Stop-Process 终止旧主进程，不能保证正在执行的任务完整退出；它不会等待业务任务自动完成。外部工具已经执行的操作也不会被撤销。
 
 只编译验证、不替换或重启：
@@ -31,7 +33,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\update-cc-connect.ps1 `
 ## 脚本流程
 
 1. 取得目标目录的更新锁，检查配置与工具链。
-2. 执行 npm run build；无 node_modules 时先 npm ci。
+2. 执行 npm run build；无 node_modules 时，有 package-lock.json 则先 npm ci，否则 npm install。
 3. Go 编译候选文件并运行 --version。编译失败不停止旧实例。
 4. 按完整可执行文件路径定位进程，核对其显式 --config。不同配置、多实例或目标已注册 Windows 服务时拒绝部署。
 5. 备份旧文件，核验 PID/创建时间后停止目标进程，再复制候选程序。

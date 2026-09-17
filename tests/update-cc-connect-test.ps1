@@ -28,6 +28,33 @@ function Start-CcProcess([string]$Target, [string]$Config, [string]$LogPrefix) {
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('cc-update-test-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $testRoot | Out-Null
 try {
+    & {
+        function Invoke-CcCommand([string]$File, [string[]]$Arguments) {
+            $script:InstallArguments = $Arguments -join ' '
+        }
+        Push-Location $testRoot
+        try {
+            Install-CcWebDependencies 'npm.cmd'
+            if ($script:InstallArguments -ne 'install') { throw '无 npm 锁文件时应使用 install' }
+            [IO.File]::WriteAllText((Join-Path $testRoot 'package-lock.json'), '{}')
+            Install-CcWebDependencies 'npm.cmd'
+            if ($script:InstallArguments -ne 'ci') { throw '存在 npm 锁文件时应使用 ci' }
+            Write-Host 'PASS npm-install-without-lockfile'
+        } finally { Pop-Location }
+    }
+    # PATH 中无 Go 时，必须识别用户工具目录中的不同 Go 版本。
+    & {
+        $savedLocalAppData = $env:LOCALAPPDATA
+        function Get-Command { param($Name, $ErrorAction) return $null }
+        try {
+            $env:LOCALAPPDATA = $testRoot
+            $expectedGo = Join-Path $testRoot 'Programs\cc-connect-tools\go1.26.8\go\bin\go.exe'
+            New-Item -ItemType Directory -Path (Split-Path $expectedGo) -Force | Out-Null
+            [IO.File]::WriteAllText($expectedGo, '')
+            if ((Find-CcGo) -ne $expectedGo) { throw '未找到用户目录中的 Go 工具链' }
+            Write-Host 'PASS go-discovery-versioned-user-install'
+        } finally { $env:LOCALAPPDATA = $savedLocalAppData }
+    }
     foreach ($scenario in @('success', 'rollback-running', 'rollback-stopped', 'first-install-failed', 'stop-failed')) {
         $caseDir = Join-Path $testRoot $scenario
         New-Item -ItemType Directory -Path $caseDir | Out-Null
