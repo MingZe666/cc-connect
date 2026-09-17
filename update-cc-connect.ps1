@@ -12,7 +12,9 @@ param(
     [string]$ConfigPath = "$env:USERPROFILE\.cc-connect\config.toml",
     [string]$TargetPath,
     [string]$GoPath,
-    [switch]$BuildOnly
+    [switch]$BuildOnly,
+    [switch]$MapOnly,
+    [switch]$SkipCommandMapping
 )
 
 $ErrorActionPreference = 'Stop'
@@ -142,9 +144,46 @@ function Install-CcBinary([string]$Candidate, [string]$Target, [string]$Config, 
     }
 }
 
+# 写入独立托管区块，保留用户其余配置；追加到末尾覆盖此前的普通别名定义。
+function Install-CcCommandMapping([string]$Target, [string]$ProfileFile) {
+    if (!(Test-Path -LiteralPath $Target -PathType Leaf)) { throw "映射目标不存在：$Target" }
+    $begin = '# BEGIN cc-connect managed alias'
+    $end = '# END cc-connect managed alias'
+    $original = ''
+    if (Test-Path -LiteralPath $ProfileFile) { $original = [IO.File]::ReadAllText($ProfileFile) }
+    $pattern = '(?ms)^' + [regex]::Escape($begin) + '\r?\n.*?^' + [regex]::Escape($end) + '(?:\r?\n|$)'
+    # 标记残缺时不猜测删除范围，避免吞掉用户自己的配置。
+    $blocks = [regex]::Matches($original, $pattern)
+    $begins = [regex]::Matches($original, '(?m)^' + [regex]::Escape($begin) + '\r?$').Count
+    $ends = [regex]::Matches($original, '(?m)^' + [regex]::Escape($end) + '\r?$').Count
+    if ($begins -ne $blocks.Count -or $ends -ne $blocks.Count) { throw "映射区块标记不完整，请检查 $ProfileFile" }
+    $preserved = [regex]::Replace($original, $pattern, '')
+    if ($preserved.Length -gt 0 -and !$preserved.EndsWith("`n")) { $preserved += "`r`n" }
+    # PowerShell 单引号字符串中的单引号必须成对转义，路径不作为命令解释。
+    $escaped = [IO.Path]::GetFullPath($Target).Replace("'", "''")
+    $updated = $preserved + "$begin`r`nSet-Alias -Name cc-connect -Value '$escaped' -Scope Global`r`n$end`r`n"
+    if ($updated -cne $original) {
+        New-Item -ItemType Directory -Path (Split-Path -Parent $ProfileFile) -Force | Out-Null
+        if (Test-Path -LiteralPath $ProfileFile) {
+            $backup = $ProfileFile + '.cc-connect-' + [Guid]::NewGuid().ToString('N') + '.bak'
+            Copy-Item -LiteralPath $ProfileFile -Destination $backup
+            Write-Host "PowerShell 配置备份：$backup"
+        }
+        # 带 BOM 的 UTF-8 兼容 Windows PowerShell 5 中的中文路径及原有配置。
+        [IO.File]::WriteAllText($ProfileFile, $updated, [Text.UTF8Encoding]::new($true))
+    }
+    Write-Host "命令映射已保存：cc-connect -> $Target"
+    Write-Host "配置文件：$ProfileFile；新窗口自动生效，当前窗口请执行：. `$PROFILE"
+}
+
 # 主流程复用项目 npm/Go 构建入口；部署锁覆盖编译到启动，避免同时更新。
 function Invoke-CcUpdate {
     $target = [IO.Path]::GetFullPath($TargetPath)
+    if ($MapOnly) {
+        if ($BuildOnly -or $SkipCommandMapping) { throw '-MapOnly 不能与 -BuildOnly 或 -SkipCommandMapping 同时使用。' }
+        Install-CcCommandMapping $target $PROFILE.CurrentUserCurrentHost
+        return
+    }
     $config = (Resolve-Path -LiteralPath $ConfigPath).Path
     $directory = Split-Path -Parent $target
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
@@ -175,6 +214,10 @@ function Invoke-CcUpdate {
         if ($BuildOnly) { return }
         Write-Host '开始替换并重启；目标进程尚未完成的任务会被中断。'
         Install-CcBinary $candidate $target $config $runDirectory
+        if (!$SkipCommandMapping) {
+            try { Install-CcCommandMapping $target $PROFILE.CurrentUserCurrentHost }
+            catch { Write-Warning "程序已更新并启动，但命令映射失败：$_。可使用 -MapOnly 重试。" }
+        }
         Write-Host "更新完成：$target；备份与日志：$runDirectory"
     } finally { $lock.Dispose() }
 }

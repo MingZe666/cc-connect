@@ -403,6 +403,20 @@ make build
 ```
 
 
+### Windows 源码一键更新
+
+在源码仓库目录使用新版脚本：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\update-cc-connect.ps1
+```
+
+自动编译、备份、替换 `dist\cc-connect.exe`、后台重启并保存当前用户的 PowerShell 命令映射。请在当前任务结束后执行。完成后当前窗口运行 `. $PROFILE`，再用 `Get-Command cc-connect` 确认显示 `Alias`；新窗口正常加载 profile 后自动生效。
+
+只设置映射使用 `-MapOnly`；只编译验证使用 `-BuildOnly`。脚本管理直接运行的进程，不会覆盖 npm 启动器或注册 Windows 服务。
+
+详见 [Windows 更新、路径设置与命令映射说明](docs/windows-update.md)。
+
 ### ⚙️ 配置
 
 > **💡 推荐使用 Web UI 配置** — 安装完成后，运行 `cc-connect web` 配置 Web 管理后台并在浏览器中打开。可以可视化创建项目、添加平台、管理服务商、直接和 Agent 聊天，无需手动编辑 TOML 文件。**注意：** `cc-connect web` 仅用于配置和打开浏览器，并不会启动 cc-connect 服务本身，你仍需单独运行 `cc-connect` 来启动。

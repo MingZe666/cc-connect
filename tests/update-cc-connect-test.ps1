@@ -99,6 +99,38 @@ try {
     Write-Host 'PASS duplicate-config'
     Assert-CcConfig ([pscustomobject]@{CommandLine = ('cc-connect -config "{0}"' -f $script:TestConfig)}) $script:TestConfig
     Write-Host 'PASS single-dash-config'
+
+    # 映射在临时 profile 内测试，不写真实用户配置；覆盖中文、空格和单引号路径。
+    $mappingDir = Join-Path $testRoot "映射 space's"
+    New-Item -ItemType Directory -Path $mappingDir | Out-Null
+    $mappingTarget = Join-Path $mappingDir 'cc-connect.exe'
+    [IO.File]::WriteAllText($mappingTarget, 'fixture')
+    $profileFixture = Join-Path $testRoot 'profile.ps1'
+    $originalProfile = "# 用户原有中文配置`r`nSet-Alias cc-connect 'C:\old\cc-connect.exe'`r`n"
+    [IO.File]::WriteAllText($profileFixture, $originalProfile, [Text.UTF8Encoding]::new($true))
+    Install-CcCommandMapping $mappingTarget $profileFixture
+    $firstProfile = [IO.File]::ReadAllText($profileFixture)
+    if (!$firstProfile.StartsWith($originalProfile)) { throw '修改了用户原有配置' }
+    Install-CcCommandMapping $mappingTarget $profileFixture
+    if ([IO.File]::ReadAllText($profileFixture) -cne $firstProfile) { throw '重复映射不是幂等操作' }
+    if (@(Get-ChildItem -LiteralPath $testRoot -Filter 'profile.ps1.cc-connect-*.bak').Count -ne 1) { throw '重复执行不应创建多余备份' }
+    . $profileFixture
+    if ((Get-Alias cc-connect).Definition -ne $mappingTarget) { throw '转义后的映射不能生效' }
+    Write-Host 'PASS mapping-preserves-profile-and-idempotence'
+    $secondTarget = Join-Path $testRoot 'other.exe'
+    [IO.File]::WriteAllText($secondTarget, 'fixture')
+    Install-CcCommandMapping $secondTarget $profileFixture
+    . $profileFixture
+    if ((Get-Alias cc-connect).Definition -ne $secondTarget) { throw '更新部署路径后仍指向旧文件' }
+    if ([regex]::Matches([IO.File]::ReadAllText($profileFixture), '# BEGIN cc-connect managed alias').Count -ne 1) { throw '托管区块重复' }
+    Write-Host 'PASS mapping-retarget'
+    $brokenProfile = Join-Path $testRoot 'broken-profile.ps1'
+    [IO.File]::WriteAllText($brokenProfile, '# BEGIN cc-connect managed alias')
+    $rejected = $false
+    try { Install-CcCommandMapping $mappingTarget $brokenProfile } catch { $rejected = $true }
+    if (!$rejected) { throw '不完整托管区块未被拒绝' }
+    Write-Host 'PASS mapping-incomplete-marker'
+
 } finally {
     # 仅递归清理本测试创建且已确认位于临时目录的独立目录。
     $resolved = [IO.Path]::GetFullPath($testRoot)
